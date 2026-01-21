@@ -1,0 +1,28 @@
+{
+  "name": "be",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "nodemon server.js",
+    "create-index": "node src/config/createVectorIndex.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "@huggingface/inference": "^4.13.10",
+    "@langchain/textsplitters": "^1.0.1",
+    "axios": "^1.13.2",
+    "cors": "^2.8.5",
+    "csv-parser": "^3.2.0",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "mongodb": "^6.9.0",
+    "mongoose": "^9.1.2",
+    "nodemon": "^3.1.11",
+    "openai": "^6.16.0",
+    "serpapi": "^2.2.1"
+  }
+}
