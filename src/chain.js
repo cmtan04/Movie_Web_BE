@@ -4,7 +4,7 @@ import dotenv from 'dotenv';
 import axios from 'axios';
 
 dotenv.config();
-const HF_API_URL = "http://localhost:8000/embed";
+const HF_API_URL = "https://cmtan04-movie-chatbot.hf.space/embed";
 const HF_API_TOKEN = process.env.HF_API_TOKEN || "";
 const HIDE_OVERVIEW = process.env.HIDE_OVERVIEW === '1';
 
