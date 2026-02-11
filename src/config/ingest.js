@@ -6,37 +6,47 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
-import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 dotenv.config();
 
-const HF_API_URL = "http://localhost:8000/embed";
+const HF_API_URL = process.env.HF_API_URL || "http://localhost:8000/embed";
 const HF_API_TOKEN = process.env.HF_API_TOKEN || "";
 
 // Delay helper để tránh rate limit
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+const CHUNK_SIZE = 500; // Số ký tự per chunk
+const CHUNK_OVERLAP = 50; // Overlap giữa chunks
 
-//=======CHUNKING CONFIG========//
-const CHUNK_SIZE = 512; // Số ký tự per chunk
-const CHUNK_OVERLAP = 64; // Overlap giữa chunks
+// Cắt text thành chunks với overlap
+function chunkText(text, chunkSize = CHUNK_SIZE, overlap = CHUNK_OVERLAP) {
+    if (!text || text.length === 0) return [];
+    const chunks = [];
+    let start = 0;
+    while (start < text.length) {
+        const end = Math.min(start + chunkSize, text.length);
+        chunks.push(text.slice(start, end));
+        start = end - overlap;
+        if (start < 0) start = 0;
+    }
+    return chunks.length > 0 ? chunks : [text];
+}
 
-// Khởi tạo text splitter từ LangChain (tách thông minh theo câu/dấu câu)
-const textSplitter = new RecursiveCharacterTextSplitter({
-    chunkSize: CHUNK_SIZE,
-    chunkOverlap: CHUNK_OVERLAP,
-    separators: ["\n\n", "\n", ". ", "! ", "? ", "; ", ", ", " ", ""],
-    keepSeparator: true,
-});
-
-// =======LẤY EMBEDDINGS ==========//
+// Lấy embeddings từ Hugging Face
 async function getVectors(texts) {
     try {
-        const headers = { 'Content-Type': 'application/json' };
-        const response = await axios.post(HF_API_URL, { inputs: texts }, { headers });
+        const response = await axios.post(HF_API_URL,
+            { inputs: texts },
+            {
+                headers: {
+                    'Authorization': HF_API_TOKEN ? `Bearer ${HF_API_TOKEN}` : undefined,
+                    'Content-Type': 'application/json'
+                }
+            }
+        );
         return response.data;
     } catch (error) {
         console.error("Lỗi lấy embeddings từ Hugging Face:", error.message);
@@ -64,16 +74,9 @@ async function run() {
 
     try {
         await client.connect();
-        console.log("Kết nối MongoDB thành công!");
+        console.log("✓ Kết nối MongoDB thành công!");
 
         const collection = client.db("movie_bot").collection("movies");
-
-        // Tạo unique index để tránh duplicate chunks
-        await collection.createIndex(
-            { movieTitle: 1, chunkIndex: 1 },
-            { unique: true, sparse: true }
-        );
-        console.log("Tạo unique index cho chunks");
 
         const castMap = new Map();
 
@@ -101,12 +104,12 @@ async function run() {
                 // Skip các phim có JSON không hợp lệ
             }
         });
-        console.log(`Đọc xong ${creditsData.length} phim từ credits.csv`);
+        console.log(`✓ Đọc xong ${creditsData.length} phim từ credits.csv`);
 
         console.log("2. Đang đọc file Movies...");
         const moviesPath = path.join(__dirname, '../data/csv/tmdb_5000_movies.csv');
         const moviesRaw = await readCSV(moviesPath);
-        console.log(`Đọc xong ${moviesRaw.length} phim từ movies.csv`);
+        console.log(`✓ Đọc xong ${moviesRaw.length} phim từ movies.csv`);
 
         console.log("3. Xử lý dữ liệu và lấy embeddings (batch size: 30)...");
 
@@ -118,7 +121,7 @@ async function run() {
                 castMap.has(m.title);
         });
 
-        console.log(`Tìm thấy ${validMovies.length}/${moviesRaw.length} phim có đầy đủ thông tin`);
+        console.log(`✓ Tìm thấy ${validMovies.length}/${moviesRaw.length} phim có đầy đủ thông tin`);
 
         for (let i = 0; i < validMovies.length; i += 30) {
             const batch = validMovies.slice(i, i + 30);
@@ -128,7 +131,7 @@ async function run() {
             for (const m of batch) {
                 const castInfo = castMap.get(m.title);
 
-                // Chuẩn hóa thành mảng các tên sạch
+                // Parse genres/keywords to names list
                 const parseList = (val) => {
                     if (!val) return [];
                     try {
@@ -165,8 +168,8 @@ async function run() {
                     `Phổ biến: ${m.popularity ?? 'N/A'}`
                 ].join('. ') + '.';
 
-                // Cắt text thành chunks bằng LangChain splitter
-                const chunks = await textSplitter.splitText(fullText);
+                // Cắt text thành chunks
+                const chunks = chunkText(fullText);
 
                 // Tạo document cho từng chunk
                 for (let chunkIdx = 0; chunkIdx < chunks.length; chunkIdx++) {
@@ -195,28 +198,11 @@ async function run() {
                 }
             }
 
-            // Kiểm tra chunk nào đã có trong DB (theo movieTitle + chunkIndex)
-            const chunkKeys = preparedBatch.map(p => ({ movieTitle: p.movieTitle, chunkIndex: p.chunkIndex }));
-            const existingChunks = await collection.find({
-                $or: chunkKeys
-            }).project({ movieTitle: 1, chunkIndex: 1 }).toArray();
-
-            const existingSet = new Set(existingChunks.map(c => `${c.movieTitle}#${c.chunkIndex}`));
-
-            // Lọc chỉ chunks mới (chưa có trong DB)
-            const newChunks = preparedBatch.filter(p => !existingSet.has(`${p.movieTitle}#${p.chunkIndex}`));
-            const newMovieTitles = [...new Set(newChunks.map(p => p.movieTitle))];
-
-            if (newChunks.length === 0) {
-                console.log(`Batch ${Math.floor(i / 30) + 1}: Tất cả chunks đã có trong DB, bỏ qua`);
-                continue;
-            }
-
-            // Lấy embeddings chỉ cho chunks mới
-            const vectors = await getVectors(newChunks.map(p => p.chunkText || p.text_for_ai));
+            // Lấy embeddings cho tất cả chunks
+            const vectors = await getVectors(preparedBatch.map(p => p.chunkText || p.text_for_ai));
 
             if (vectors) {
-                const finalDocs = newChunks.map((p, idx) => {
+                const finalDocs = preparedBatch.map((p, idx) => {
                     const { text_for_ai, chunkText, ...docToSave } = p;
                     return {
                         ...docToSave,
@@ -225,19 +211,20 @@ async function run() {
                     };
                 });
 
-                // Insert chunks mới
+                // Insert với ordered: false để bỏ qua lỗi duplicate key
                 try {
                     await collection.insertMany(finalDocs, { ordered: false });
-                    console.log(`✓ Nạp batch ${Math.floor(i / 30) + 1}/${Math.ceil(validMovies.length / 30)}: Thêm ${finalDocs.length} chunks từ ${newMovieTitles.length} phim (${existingChunks.length} chunks đã có)`);
+                    console.log(`✓ Nạp batch ${Math.floor(i / 30) + 1}/${Math.ceil(validMovies.length / 30)} (${finalDocs.length} chunks từ ${new Set(preparedBatch.map(p => p.movieTitle)).size} phim)`);
                 } catch (insertError) {
+                    // Bỏ qua lỗi duplicate, tiếp tục batch tiếp theo
                     if (insertError.code === 11000) {
-                        console.warn(`Batch ${Math.floor(i / 30) + 1}: Có ${insertError.result?.insertedCount || 0} chunks được insert, ${finalDocs.length - (insertError.result?.insertedCount || 0)} chunks trùng bỏ qua`);
+                        console.warn(`⚠ Batch ${Math.floor(i / 30) + 1}: Có chunks trùng, bỏ qua`);
                     } else {
                         throw insertError;
                     }
                 }
             } else {
-                console.warn(`Batch ${Math.floor(i / 30) + 1} bị lỗi khi lấy embeddings`);
+                console.warn(`⚠ Batch ${Math.floor(i / 30) + 1} bị lỗi khi lấy embeddings`);
             }
 
             // Delay 500ms giữa các batch để tránh rate limit
@@ -246,16 +233,13 @@ async function run() {
             }
         }
 
-        // Đếm tổng chunks đã nạp
-        const totalChunks = await collection.countDocuments({});
-        console.log(`\nHoàn tất nạp dữ liệu!`);
-        console.log(`Tổng chunks trong DB: ${totalChunks}`);
+        console.log("✓ Hoàn tất nạp dữ liệu!");
     } catch (error) {
-        console.error("Lỗi:", error.message);
+        console.error("❌ Lỗi:", error.message);
         process.exit(1);
     } finally {
         await client.close();
-        console.log("Đóng kết nối MongoDB");
+        console.log("✓ Đóng kết nối MongoDB");
     }
 }
 

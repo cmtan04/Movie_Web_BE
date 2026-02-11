@@ -2,6 +2,7 @@
   "name": "be",
   "version": "1.0.0",
   "main": "server.js",
+  "type": "module",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "nodemon server.js",
@@ -12,8 +13,7 @@
   "description": "",
   "dependencies": {
     "@google/generative-ai": "^0.21.0",
-    "@huggingface/inference": "^4.13.10",
-    "@langchain/textsplitters": "^1.0.1",
+    "@huggingface/inference": "^4.13.12",
     "axios": "^1.13.2",
     "cors": "^2.8.5",
     "csv-parser": "^3.2.0",

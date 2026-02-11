@@ -1,20 +1,17 @@
 import { OpenAI } from "openai";
 import client from "./config/mongoDB.config.js";
 import dotenv from 'dotenv';
-import axios from 'axios';
+import { InferenceClient } from "@huggingface/inference";
 
 dotenv.config();
-const HF_API_URL = "https://cmtan04-movie-chatbot.hf.space/embed";
-const HF_API_TOKEN = process.env.HF_API_TOKEN || "";
+const HF_API_TOKEN = process.env.HUGGING_FACE_TOKEN || "";
 const HIDE_OVERVIEW = process.env.HIDE_OVERVIEW === '1';
 
 // 1. Cấu hình danh sách Model dự phòng (Ưu tiên từ trên xuống dưới)
 const MODEL_PRIORITY_LIST = [
 
-    "meta-llama/llama-3.3-70b-instruct:free",      // Ưu tiên 1: Đa năng nhất
-    "z-ai/glm-4.5-air:free",                // Ưu tiên 2: Hiểu tiếng Việt sâu
-    "qwen/qwen-2.5-vl-7b-instruct:free",     // Ưu tiên 3: Xử lý cực tốt nếu có HÌNH ẢNH/VIDEO
-    "xiaomi/mimo-v2-flash:free"             // Ưu tiên 4: Tốc độ siêu nhanh
+    "arcee-ai/trinity-large-preview:free", // Model ưu tiên hàng đầu
+    "openrouter/free"                      // Model dự phòng nếu model trên lỗi
 
 ];
 
@@ -27,41 +24,19 @@ const openai = new OpenAI({
     }
 });
 
-export class RAGChain {
+class RAGChain {
     constructor() {
-        // Lưu conversation history theo sessionId/userId
-        this.sessions = new Map();
-        this.MAX_HISTORY = 10; // Giữ tối đa 10 messages gần nhất
+        this.conversationHistory = [
+            {
+                role: "system",
+                content: "Bạn là trợ lý ảo MovieDB. Chỉ dùng dữ liệu được cung cấp để trả lời về phim. BẮT BUỘC trả lời bằng tiếng Việt"
+            }
+        ];
     }
 
-    getSession(sessionId = 'default') {
-        if (!this.sessions.has(sessionId)) {
-            this.sessions.set(sessionId, [
-                {
-                    role: "system",
-                    content: "Bạn là trợ lý ảo MovieDB chuyên về phim ảnh. Bạn có khả năng nhớ các câu hỏi trước đó trong cuộc trò chuyện. Chỉ dùng dữ liệu được cung cấp để trả lời một cách chính xác và chi tiết. BẮT BUỘC trả lời bằng tiếng Việt. Nếu người dùng hỏi về thông tin từ câu hỏi trước, hãy tham khảo lịch sử hội thoại. Khi trả lời, hãy luôn dựa trên dữ liệu được cung cấp và không bịa ra thông tin."
-                }
-            ]);
-        }
-        return this.sessions.get(sessionId);
-    }
-
-    clearSession(sessionId = 'default') {
-        this.sessions.delete(sessionId);
-    }
-
-    async run(userQuery, sessionId = 'default') {
-        // Lấy conversation history cho session này
-        const conversationHistory = this.getSession(sessionId);
-
+    async run(userQuery) {
         // HYBRID SEARCH: kết hợp vector (semantic) + regex (keyword)
         let searchResults = await this.performHybridSearch(userQuery);
-
-        console.log(`📋 Search Results for "${userQuery}":`, {
-            count: searchResults.length,
-            titles: searchResults.map(m => m.title),
-            hasMetadata: searchResults.map(m => !!m.title && !!m.overview)
-        });
 
         // Xây context với thêm metadata (đạo diễn, diễn viên, năm, điểm)
         let contextData = searchResults.map((m, i) => {
@@ -74,74 +49,76 @@ export class RAGChain {
             return base;
         }).join("\n");
 
-        console.log(`📝 Context Data:\n${contextData}`);
+        if (contextData) {
+            const aiMessage = await this.synthesizeAnswer(userQuery, contextData);
+            return aiMessage;
 
-        const finalPrompt = contextData
-            ? `Dữ liệu phim:\n${contextData}\n\nCâu hỏi: ${userQuery}`
-            : `Câu hỏi: ${userQuery}`;
+            // --- CƠ CHẾ FALLBACK TỰ ĐỘNG ---
+            // for (const modelName of MODEL_PRIORITY_LIST) {
+            //     try {
+            //         console.log(`🚀 [SYSTEM] Đang thử với model: ${modelName}...`);
 
-        conversationHistory.push({ role: "user", content: finalPrompt });
+            //         const response = await openai.chat.completions.create({
+            //             model: modelName,
+            //             messages: this.conversationHistory.slice(-10),
+            //             temperature: 0.7,
+            //         });
 
-        // Giới hạn history (giữ system message + 10 messages gần nhất)
-        if (conversationHistory.length > this.MAX_HISTORY + 1) {
-            conversationHistory.splice(1, conversationHistory.length - this.MAX_HISTORY - 1);
+            //         const aiMessage = response.choices[0].message.content;
+            //         this.conversationHistory.push({ role: "assistant", content: aiMessage });
+
+            //         console.log(`✅ [SYSTEM] Thành công với model: ${modelName}`);
+            //         return aiMessage;
+
+            //     } catch (error) {
+            //         console.error(`❌ [ERROR] Model ${modelName} gặp lỗi:`, error.message);
+            //         // Nếu là model cuối cùng mà vẫn lỗi thì mới báo lỗi thật
+            //         if (modelName === MODEL_PRIORITY_LIST[MODEL_PRIORITY_LIST.length - 1]) {
+            //             return `Không tìm thấy thông tin hoặc tất cả các model đều không phản hồi.`;
+            //         }
+            //     }
+            // }
+        } else {
+            console.log("Không tìm thấy trong database");
+            return "không tìm thấy";
         }
 
-        // --- CƠ CHẾ FALLBACK TỰ ĐỘNG ---
+
+    }
+
+    async synthesizeAnswer(userQuery, context) {
+        const finalPrompt = `Dựa vào thông tin sau:\n${context}\n\nHãy trả lời câu hỏi: ${userQuery}`;
+
+        // Không thêm vào history chính để tránh nhiễu
+        const messages = [
+            ...this.conversationHistory,
+            { role: "user", content: finalPrompt }
+        ];
+
         for (const modelName of MODEL_PRIORITY_LIST) {
             try {
-                console.log(`🚀 [SYSTEM] Đang thử với model: ${modelName}...`);
+                console.log(`🚀 [SYSTEM] Đang tổng hợp câu trả lời với model: ${modelName}...`);
 
                 const response = await openai.chat.completions.create({
                     model: modelName,
-                    messages: conversationHistory,
+                    messages: messages.slice(-10), // Giữ context gần nhất
                     temperature: 0.7,
                 });
 
                 const aiMessage = response.choices[0].message.content;
-                conversationHistory.push({ role: "assistant", content: aiMessage });
+                // Thêm cả câu hỏi gốc và câu trả lời tổng hợp vào history
+                this.conversationHistory.push({ role: "user", content: userQuery });
+                this.conversationHistory.push({ role: "assistant", content: aiMessage });
 
-                console.log(`✅ [SYSTEM] Thành công với model: ${modelName}`);
+                console.log(`✅ [SYSTEM] Tổng hợp thành công với model: ${modelName}`);
                 return aiMessage;
 
             } catch (error) {
-                console.error(`❌ [ERROR] Model ${modelName} gặp lỗi:`, error.message);
-                console.warn(`⚠️ [WARNING] Model ${modelName} bị lỗi hoặc hết lượt. Đang đổi model tiếp theo...`);
-                // Nếu là model cuối cùng mà vẫn lỗi thì mới báo lỗi thật
+                console.error(`❌ [ERROR] Model ${modelName} gặp lỗi khi tổng hợp:`, error.message);
                 if (modelName === MODEL_PRIORITY_LIST[MODEL_PRIORITY_LIST.length - 1]) {
-                    throw new Error("Tất cả các model đều không phản hồi.");
+                    throw new Error("Tất cả các model đều không phản hồi để tổng hợp câu trả lời.");
                 }
             }
-        }
-    }
-
-    // Tổng hợp kết quả từ TMDB hoặc Google thành câu trả lời tự nhiên
-    async synthesizeAnswer(userQuery, contextData) {
-        try {
-            const prompt = `Dựa trên thông tin sau đây, hãy trả lời câu hỏi của người dùng một cách tự nhiên, chi tiết và có cấu trúc rõ ràng bằng tiếng Việt:
-
-                            ${contextData}
-
-                            Câu hỏi: ${userQuery}
-
-                            Hãy tổng hợp thông tin trên thành câu trả lời mạch lạc, dễ hiểu. Nếu có nhiều phim/kết quả, liệt kê ngắn gọn từng item với thông tin quan trọng nhất. Hãy chắc chắn rằng câu trả lời của bạn hoàn toàn dựa trên dữ liệu được cung cấp.`;
-
-            const response = await openai.chat.completions.create({
-                model: MODEL_PRIORITY_LIST[0],
-                messages: [
-                    {
-                        role: "system",
-                        content: "Bạn là trợ lý phim ảnh thông minh. Tổng hợp thông tin được cung cấp thành câu trả lời tự nhiên, chính xác và dễ hiểu. Trả lời bằng tiếng Việt."
-                    },
-                    { role: "user", content: prompt }
-                ],
-                temperature: 0.7,
-            });
-
-            return response.choices[0].message.content;
-        } catch (error) {
-            console.error("❌ Lỗi synthesize answer:", error.message);
-            throw error;
         }
     }
 
@@ -152,33 +129,26 @@ export class RAGChain {
         const collection = db.collection("movies");
         const keywords = query.trim().split(/\s+/).filter(k => k.length > 0);
         if (keywords.length === 0) return [];
-
-        // Tạo regex patterns cho mỗi keyword
         const regexPatterns = keywords.map(k => new RegExp(k, 'i'));
 
-        // Tạo các điều kiện $or cho từng keyword
-        const orConditions = [];
+        // Director match: mỗi keyword tạo một $elemMatch riêng để kết hợp job
+        const directorConditions = keywords.map(k => ({
+            'cast_crew_full.crew': { $elemMatch: { job: 'Director', name: new RegExp(k, 'i') } }
+        }));
 
-        for (const pattern of regexPatterns) {
-            orConditions.push({ title: pattern });
-            orConditions.push({ overview: pattern });
-            orConditions.push({ genres: pattern });
-            orConditions.push({ keywords: pattern });
-            orConditions.push({ 'cast_crew_full.cast.name': pattern });
-            orConditions.push({ 'cast_crew_full.crew.name': pattern });
-        }
+        const orConditions = [
+            { title: { $in: regexPatterns } },
+            { overview: { $in: regexPatterns } },
+            { genres: { $in: regexPatterns } },
+            { keywords: { $in: regexPatterns } },
+            { homepage: { $in: regexPatterns } },
+            { release_date: { $in: regexPatterns } },
+            { 'cast_crew_full.cast': { $elemMatch: { name: { $in: regexPatterns } } } },
+            { 'cast_crew_full.crew': { $elemMatch: { name: { $in: regexPatterns } } } },
+            ...directorConditions,
+        ];
 
-        const chunks = await collection.find({
-            $and: [
-                { $or: orConditions },
-                { isChunk: true }
-            ]
-        }).limit(30).toArray();
-
-        console.log(`🔍 Regex search for "${query}": found ${chunks.length} chunks`);
-
-        // Nhóm chunks theo phim
-        return this.groupChunksByMovie(chunks);
+        return await collection.find({ $or: orConditions }).limit(5).toArray();
     }
 
     // Vector search ưu tiên: Atlas $vectorSearch nếu có; fallback tính cosine similarity phía Node
@@ -198,8 +168,8 @@ export class RAGChain {
                         index: 'movies_embedding_index',
                         path: 'embedding',
                         queryVector: embedding,
-                        numCandidates: 100,
-                        limit: 20,  // Giảm để nhanh hơn
+                        numCandidates: 200,
+                        limit: 50, // Lấy nhiều chunks hơn để nhóm
                     }
                 },
                 {
@@ -237,75 +207,41 @@ export class RAGChain {
             .filter(d => Array.isArray(d.embedding))
             .map(d => ({ ...d, _score: this.cosineSimilarity(embedding, d.embedding) }))
             .sort((a, b) => b._score - a._score)
-            .slice(0, 20)  // Giảm từ 50 → 20
+            .slice(0, 50)
             .map(({ embedding: _emb, ...rest }) => rest);
 
         return this.groupChunksByMovie(scored);
     }
 
     // Nhóm chunks cùng phim, ưu tiên chunk có score cao nhất
-    async groupChunksByMovie(results) {
+    groupChunksByMovie(results) {
         const movieMap = new Map();
 
         for (const chunk of results) {
             const movieTitle = chunk.movieTitle || chunk.title;
-            const existing = movieMap.get(movieTitle);
-
-            // Lấy chunk có _score cao nhất
-            if (!existing || (chunk._score && chunk._score > (existing._score || 0))) {
+            if (!movieMap.has(movieTitle)) {
+                // Lấy chunk đầu tiên làm representative
                 movieMap.set(movieTitle, chunk);
             }
         }
 
-        // Lấy các movie title từ chunks
-        const movieTitles = Array.from(movieMap.keys());
-        console.log(`🎬 Extracting ${movieTitles.length} movies from chunks:`, movieTitles);
-
-        // Query MongoDB để lấy đầy đủ movie objects
-        const db = client.db("movie_bot");
-        const collection = db.collection("movies");
-
-        try {
-            // Thử query: lấy documents có title match (có thể là full movies hoặc chunks)
-            const movies = await collection.find({
-                title: { $in: movieTitles }
-            }).limit(5).toArray();
-
-            console.log(`✅ Retrieved ${movies.length} documents:`, movies.map(m => m.title));
-
-            // Filter để lấy những document có đầy đủ metadata (không phải chunks)
-            // Chunks thường ngắn, movies thường có overview dài
-            const fullMovies = movies.filter(m =>
-                m.overview && m.overview.length > 50 &&
-                (m.cast_crew_full || m.genres)
-            );
-
-            if (fullMovies.length > 0) {
-                console.log(`✅ Filtered to ${fullMovies.length} full movie documents`);
-                return fullMovies;
-            }
-
-            // Nếu không filter được, trả về tất cả (fallback)
-            console.log(`⚠️ No full movie documents found, returning all documents`);
-            return movies.length > 0 ? movies : Array.from(movieMap.values()).slice(0, 5);
-        } catch (error) {
-            console.error(`❌ Error querying movies:`, error.message);
-            return Array.from(movieMap.values()).slice(0, 5);
-        }
+        return Array.from(movieMap.values()).slice(0, 5);
     }
 
     async getQueryEmbedding(text) {
         try {
-            const headers = { 'Content-Type': 'application/json' };
-            const resp = await axios.post(HF_API_URL, { inputs: text }, { headers });
+            const client = new InferenceClient(HF_API_TOKEN || undefined);
 
-            // Hugging Face API trả về array hoặc nested array
-            const data = resp.data;
-            if (Array.isArray(data)) {
-                // Nếu là array 1 chiều (embedding trực tiếp)
-                if (typeof data[0] === 'number') return data;
-                // Nếu là nested array (batch)
-                if (Array.isArray(data[0])) return data[0];
+            const resp = await client.featureExtraction({
+                model: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+                inputs: text,
+                provider: "auto"
+            });
+
+            // InferenceClient trả về array hoặc nested array
+            if (Array.isArray(resp)) {
+                if (typeof resp[0] === 'number') return resp;
+                if (Array.isArray(resp[0])) return resp[0];
             }
             return null;
         } catch (err) {
@@ -326,64 +262,46 @@ export class RAGChain {
         return denom ? (dot / denom) : 0;
     }
 
-    // Phát hiện intent và chọn strategy tìm kiếm tối ưu
-    detectSearchStrategy(query) {
+    // Phát hiện xem query có đề cập các trường cụ thể không
+    detectFieldKeywords(query) {
         const q = query.toLowerCase();
-
-        // Keyword search: fields cụ thể (budget, revenue, year, runtime)
-        const hasFieldQuery = /ngân sách|budget|chi phí|tiền làm|doanh thu|revenue|kiếm được|thu về|năm \d{4}|phát hành|ra mắt|thời lượng|runtime|phút|giờ|dài|trang web|homepage|website/.test(q);
-
-        // Semantic search: plot, mood, theme, similarity
-        const hasSemanticQuery = /về|nội dung|cốt truyện|giống như|tương tự|kiểu|thể loại nào|tâm trạng|cảm xúc|chủ đề/.test(q);
-
-        // Actor/Director search: tên người
-        const hasPersonQuery = /diễn viên|đạo diễn|actor|actress|director|cast|crew|vai diễn/.test(q);
-
-        // Nếu chỉ có field query → dùng regex
-        if (hasFieldQuery && !hasSemanticQuery) {
-            return 'regex';
-        }
-
-        // Nếu chỉ có semantic query → dùng vector
-        if (hasSemanticQuery && !hasFieldQuery && !hasPersonQuery) {
-            return 'vector';
-        }
-
-        // Default: hybrid (parallel)
-        return 'hybrid';
+        return {
+            budget: /ngân sách|budget|chi phí|tiền làm/.test(q),
+            revenue: /doanh thu|revenue|kiếm được|thu về/.test(q),
+            year: /năm|year|\d{4}|phát hành|ra mắt/.test(q),
+            runtime: /thời lượng|runtime|phút|giờ|dài/.test(q),
+            homepage: /trang web|homepage|website|url/.test(q),
+            popularity: /phổ biến|popularity|nổi tiếng|trending/.test(q),
+            vote: /điểm|rating|vote|đánh giá|imdb/.test(q)
+        };
     }
 
-    // HYBRID SEARCH: kết hợp vector (semantic) + regex (keyword) với parallel execution
+    // HYBRID SEARCH: kết hợp vector (semantic) + regex (keyword) với dedup
     async performHybridSearch(query) {
         if (!query) return [];
+        const fieldHints = this.detectFieldKeywords(query);
+        const needsRegex = Object.values(fieldHints).some(v => v);
 
-        const strategy = this.detectSearchStrategy(query);
+        let vectorResults = [];
+        let regexResults = [];
 
-        // Nếu intent rõ ràng, chỉ dùng 1 strategy (tiết kiệm thời gian)
-        if (strategy === 'regex') {
-            return await this.performSearch(query);
+        try {
+            vectorResults = await this.performVectorSearch(query);
+        } catch (_) {
+            // Vector search không khả dụng
         }
 
-        if (strategy === 'vector') {
-            const results = await this.performVectorSearch(query);
-            return results.length > 0 ? results : await this.performSearch(query);
+        // Nếu phát hiện từ khóa trường cụ thể hoặc vector không trả kết quả, dùng regex
+        if (needsRegex || !vectorResults || vectorResults.length === 0) {
+            regexResults = await this.performSearch(query);
         }
-
-        // Hybrid: chạy song song vector + regex (parallel search)
-        const [vectorResults, regexResults] = await Promise.allSettled([
-            this.performVectorSearch(query),
-            this.performSearch(query)
-        ]);
-
-        const vectorDocs = vectorResults.status === 'fulfilled' ? vectorResults.value : [];
-        const regexDocs = regexResults.status === 'fulfilled' ? regexResults.value : [];
 
         // Merge và deduplicate theo _id
         const seenIds = new Set();
         const merged = [];
 
         // Ưu tiên vector results (có _score)
-        for (const doc of vectorDocs) {
+        for (const doc of vectorResults) {
             const id = doc._id?.toString() || doc.title;
             if (!seenIds.has(id)) {
                 seenIds.add(id);
@@ -391,8 +309,8 @@ export class RAGChain {
             }
         }
 
-        // Thêm regex results (chưa có trong vector)
-        for (const doc of regexDocs) {
+        // Thêm regex results (chưa có trong vector) - không có _score
+        for (const doc of regexResults) {
             const id = doc._id?.toString() || doc.title;
             if (!seenIds.has(id)) {
                 seenIds.add(id);
@@ -404,4 +322,26 @@ export class RAGChain {
     }
 }
 
-export const ragChain = new RAGChain();
+let ragChain = new RAGChain();
+
+export { ragChain };
+
+export async function askChatbot(userPrompt) {
+    return await ragChain.run(userPrompt);
+}
+
+export async function vectorSearchPreview(query) {
+    return await ragChain.performVectorSearch(query);
+}
+
+export async function regexSearchPreview(query) {
+    return await ragChain.performSearch(query);
+}
+
+export async function hybridSearchPreview(query) {
+    return await ragChain.performHybridSearch(query);
+}
+
+export async function synthesizeAnswer(userQuery, context) {
+    return await ragChain.synthesizeAnswer(userQuery, context);
+}
